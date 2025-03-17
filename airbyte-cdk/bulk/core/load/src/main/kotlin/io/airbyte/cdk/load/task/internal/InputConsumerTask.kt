@@ -95,9 +95,9 @@ class DefaultInputConsumerTask(
         reserved: Reserved<DestinationStreamAffinedMessage>,
         sizeBytes: Long
     ) {
-        val stream = reserved.value.stream
-        val manager = syncManager.getStreamManager(stream)
-        val recordQueue = recordQueueSupplier.get(stream)
+        val streamDescriptor = reserved.value.stream.descriptor
+        val manager = syncManager.getStreamManager(streamDescriptor)
+        val recordQueue = recordQueueSupplier.get(streamDescriptor)
         when (val message = reserved.value) {
             is DestinationRecord -> {
                 val wrapped =
@@ -111,21 +111,23 @@ class DefaultInputConsumerTask(
             is DestinationRecordStreamComplete -> {
                 reserved.release() // safe because multiple calls conflate
                 val wrapped = StreamEndEvent(index = manager.markEndOfStream(true))
-                log.info { "Read COMPLETE for stream $stream" }
+                log.info { "Read COMPLETE for stream $streamDescriptor" }
                 recordQueue.publish(reserved.replace(wrapped))
                 recordQueue.close()
             }
             is DestinationRecordStreamIncomplete -> {
                 reserved.release() // safe because multiple calls conflate
                 val wrapped = StreamEndEvent(index = manager.markEndOfStream(false))
-                log.info { "Read INCOMPLETE for stream $stream" }
+                log.info { "Read INCOMPLETE for stream $streamDescriptor" }
                 recordQueue.publish(reserved.replace(wrapped))
                 recordQueue.close()
             }
             is DestinationFile -> {
                 val index = manager.incrementReadCount()
                 // destinationTaskLauncher.handleFile(stream, message, index)
-                fileTransferQueue.publish(FileTransferQueueMessage(stream, message, index))
+                fileTransferQueue.publish(
+                    FileTransferQueueMessage(streamDescriptor, message, index)
+                )
             }
             is DestinationFileStreamComplete -> {
                 reserved.release() // safe because multiple calls conflate
@@ -133,29 +135,31 @@ class DefaultInputConsumerTask(
                 val envelope =
                     BatchEnvelope(
                         SimpleBatch(Batch.State.COMPLETE),
-                        streamDescriptor = message.stream,
+                        streamDescriptor = streamDescriptor,
                     )
-                destinationTaskLauncher.handleNewBatch(stream, envelope)
+                destinationTaskLauncher.handleNewBatch(streamDescriptor, envelope)
             }
             is DestinationFileStreamIncomplete ->
-                throw IllegalStateException("File stream $stream failed upstream, cannot continue.")
+                throw IllegalStateException(
+                    "File stream $streamDescriptor failed upstream, cannot continue."
+                )
         }
     }
 
     private suspend fun handleRecordForPipeline(
         reserved: Reserved<DestinationStreamAffinedMessage>,
     ) {
-        val stream = reserved.value.stream
-        unopenedStreams.remove(stream)?.let {
-            log.info { "Saw first record for stream $stream; initializing" }
+        val streamDescriptor = reserved.value.stream.descriptor
+        unopenedStreams.remove(streamDescriptor)?.let {
+            log.info { "Saw first record for stream $streamDescriptor; initializing" }
             // Note, since we're not spilling to disk, there is nothing to do with
             // any records before initialization is complete, so we'll wait here
             // for it to finish.
             openStreamQueue.publish(it)
-            syncManager.getOrAwaitStreamLoader(stream)
-            log.info { "Initialization for stream $stream complete" }
+            syncManager.getOrAwaitStreamLoader(streamDescriptor)
+            log.info { "Initialization for stream $streamDescriptor complete" }
         }
-        val manager = syncManager.getStreamManager(stream)
+        val manager = syncManager.getStreamManager(streamDescriptor)
         when (val message = reserved.value) {
             is DestinationRecord -> {
                 val record = message.asDestinationRecordRaw()
@@ -163,7 +167,7 @@ class DefaultInputConsumerTask(
                 val pipelineMessage =
                     PipelineMessage(
                         mapOf(manager.getCurrentCheckpointId() to 1),
-                        StreamKey(stream),
+                        StreamKey(streamDescriptor),
                         record
                     )
                 val partition = partitioner.getPartition(record, recordQueueForPipeline.partitions)
@@ -171,20 +175,26 @@ class DefaultInputConsumerTask(
             }
             is DestinationRecordStreamComplete -> {
                 manager.markEndOfStream(true)
-                log.info { "Read COMPLETE for stream $stream" }
-                recordQueueForPipeline.broadcast(reserved.replace(PipelineEndOfStream(stream)))
+                log.info { "Read COMPLETE for stream $streamDescriptor" }
+                recordQueueForPipeline.broadcast(
+                    reserved.replace(PipelineEndOfStream(streamDescriptor))
+                )
                 reserved.release()
             }
             is DestinationRecordStreamIncomplete -> {
                 manager.markEndOfStream(false)
-                log.info { "Read INCOMPLETE for stream $stream" }
-                recordQueueForPipeline.broadcast(reserved.replace(PipelineEndOfStream(stream)))
+                log.info { "Read INCOMPLETE for stream $streamDescriptor" }
+                recordQueueForPipeline.broadcast(
+                    reserved.replace(PipelineEndOfStream(streamDescriptor))
+                )
                 reserved.release()
             }
             is DestinationFile -> {
                 val index = manager.incrementReadCount()
                 // destinationTaskLauncher.handleFile(stream, message, index)
-                fileTransferQueue.publish(FileTransferQueueMessage(stream, message, index))
+                fileTransferQueue.publish(
+                    FileTransferQueueMessage(streamDescriptor, message, index)
+                )
             }
             is DestinationFileStreamComplete -> {
                 reserved.release() // safe because multiple calls conflate
@@ -192,12 +202,14 @@ class DefaultInputConsumerTask(
                 val envelope =
                     BatchEnvelope(
                         SimpleBatch(Batch.State.COMPLETE),
-                        streamDescriptor = message.stream,
+                        streamDescriptor = streamDescriptor,
                     )
-                destinationTaskLauncher.handleNewBatch(stream, envelope)
+                destinationTaskLauncher.handleNewBatch(streamDescriptor, envelope)
             }
             is DestinationFileStreamIncomplete ->
-                throw IllegalStateException("File stream $stream failed upstream, cannot continue.")
+                throw IllegalStateException(
+                    "File stream $streamDescriptor failed upstream, cannot continue."
+                )
         }
     }
 
